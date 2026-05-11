@@ -73,7 +73,6 @@ fn emit_buffered(buffer: &[String], first_event_timestamp: Option<i64>) -> LogEv
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(NO_TIMESTAMP)
         });
-    // Join without separator to match Java's StringBuilder.append(partialLogLine) behavior.
     // No truncation here — the batcher handles chunking oversized events.
     let message = buffer.join("");
     LogEvent { timestamp, message }

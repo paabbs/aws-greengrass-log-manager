@@ -21,7 +21,7 @@
 //!
 //! **Log level filtering matches Java behavior.** JSON-structured `GreengrassLogMessage`
 //! lines are deserialized to extract the `level` field. Text-format lines pass through
-//! without level filtering (matching Java's `addNewLogEvent` path).
+//! without level filtering.
 
 use super::SealedBatch;
 use crate::config::LogLevel;
@@ -49,6 +49,26 @@ fn event_wire_size(message_bytes: usize) -> usize {
     message_bytes + TIMESTAMP_BYTES + EVENT_STORAGE_OVERHEAD
 }
 
+/// Seal the current batch of events into a SealedBatch and reset accumulators.
+fn seal_batch(
+    batches: &mut Vec<SealedBatch>,
+    events: &mut Vec<LogEvent>,
+    log_group: &str,
+    stream: &str,
+    size: &mut usize,
+    earliest: &mut Option<i64>,
+) {
+    if !events.is_empty() {
+        batches.push(SealedBatch {
+            log_group: log_group.to_string(),
+            log_stream: stream.to_string(),
+            events: std::mem::take(events),
+        });
+        *size = 0;
+        *earliest = None;
+    }
+}
+
 /// Seal log events into batches ready for CloudWatch upload.
 ///
 /// Events are sorted by timestamp, filtered by age and log level,
@@ -74,6 +94,7 @@ pub fn seal_batches(
     let mut current_size: usize = 0;
     let mut earliest_ts: Option<i64> = None;
     let mut current_stream: String = String::new();
+    let mut current_date: (i32, u8, u8) = (0, 0, 0);
 
     for event in events {
         // Drop events outside CW allowed range
@@ -106,53 +127,61 @@ pub fn seal_batches(
                 continue;
             }
 
-            let chunk_stream = stream_for_timestamp(chunk.timestamp, thing_name);
-            let wire_size = event_wire_size(chunk.message.len());
-
-            // Seal on stream change (date boundary)
-            if !current_events.is_empty() && chunk_stream != current_stream {
-                batches.push(SealedBatch {
-                    log_group: log_group.to_string(),
-                    log_stream: current_stream.clone(),
-                    events: std::mem::take(&mut current_events),
-                });
-                current_size = 0;
-                earliest_ts = None;
+            let chunk_date = time::OffsetDateTime::from_unix_timestamp(chunk.timestamp / 1000)
+                .map(|dt| (dt.year(), dt.month() as u8, dt.day()))
+                .unwrap_or((0, 0, 0));
+            if current_stream.is_empty() || chunk_date != current_date {
+                let new_stream = stream_for_timestamp(chunk.timestamp, thing_name);
+                if !current_events.is_empty() && new_stream != current_stream {
+                    seal_batch(
+                        &mut batches,
+                        &mut current_events,
+                        log_group,
+                        &current_stream,
+                        &mut current_size,
+                        &mut earliest_ts,
+                    );
+                }
+                current_stream = new_stream;
+                current_date = chunk_date;
             }
-            current_stream = chunk_stream;
+            let wire_size = event_wire_size(chunk.message.len());
 
             // Check 23-hour span
             let earliest = earliest_ts.unwrap_or(chunk.timestamp);
             if chunk.timestamp - earliest > MAX_TIME_SPAN_MS && !current_events.is_empty() {
-                batches.push(SealedBatch {
-                    log_group: log_group.to_string(),
-                    log_stream: current_stream.clone(),
-                    events: std::mem::take(&mut current_events),
-                });
-                current_size = 0;
-                earliest_ts = None;
+                seal_batch(
+                    &mut batches,
+                    &mut current_events,
+                    log_group,
+                    &current_stream,
+                    &mut current_size,
+                    &mut earliest_ts,
+                );
             }
 
             // Check event count limit
             if current_events.len() >= MAX_NUM_OF_LOG_EVENTS {
-                batches.push(SealedBatch {
-                    log_group: log_group.to_string(),
-                    log_stream: current_stream.clone(),
-                    events: std::mem::take(&mut current_events),
-                });
-                current_size = 0;
-                earliest_ts = None;
+                seal_batch(
+                    &mut batches,
+                    &mut current_events,
+                    log_group,
+                    &current_stream,
+                    &mut current_size,
+                    &mut earliest_ts,
+                );
             }
 
             // Check batch size limit
             if current_size + wire_size > MAX_BATCH_SIZE && !current_events.is_empty() {
-                batches.push(SealedBatch {
-                    log_group: log_group.to_string(),
-                    log_stream: current_stream.clone(),
-                    events: std::mem::take(&mut current_events),
-                });
-                current_size = 0;
-                earliest_ts = None;
+                seal_batch(
+                    &mut batches,
+                    &mut current_events,
+                    log_group,
+                    &current_stream,
+                    &mut current_size,
+                    &mut earliest_ts,
+                );
             }
 
             if earliest_ts.is_none() {
@@ -163,13 +192,14 @@ pub fn seal_batches(
         }
     }
 
-    if !current_events.is_empty() {
-        batches.push(SealedBatch {
-            log_group: log_group.to_string(),
-            log_stream: current_stream,
-            events: current_events,
-        });
-    }
+    seal_batch(
+        &mut batches,
+        &mut current_events,
+        log_group,
+        &current_stream,
+        &mut current_size,
+        &mut earliest_ts,
+    );
 
     batches
 }
@@ -178,8 +208,13 @@ pub fn seal_batches(
 /// Format: /{yyyy}/{MM}/{dd}/thing/{thingName}
 /// Matches Java LogManager's per-event stream naming.
 fn stream_for_timestamp(timestamp_ms: i64, thing_name: &str) -> String {
-    let dt = time::OffsetDateTime::from_unix_timestamp(timestamp_ms / 1000)
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let dt = time::OffsetDateTime::from_unix_timestamp(timestamp_ms / 1000).unwrap_or_else(|_| {
+        tracing::warn!(
+            timestamp_ms,
+            "Invalid timestamp, falling back to current UTC date"
+        );
+        time::OffsetDateTime::now_utc()
+    });
     let safe_name = thing_name.replace(':', "+");
     format!(
         "/{}/{:02}/{:02}/thing/{}",
@@ -343,14 +378,17 @@ mod tests {
 
     #[test]
     fn test_time_span_limit() {
-        let now = now_ms();
+        // Use a fixed date to keep events on the same UTC day.
+        // The 23h span check is defense-in-depth for clock-skew scenarios
+        // where events within one date have timestamps >23h apart.
+        let base = 1704067200000_i64; // 2024-01-01 00:00:00 UTC
         let hour_ms = 60 * 60 * 1000;
-        // 23h + 1min gap exceeds the 23-hour span limit
+        // Two events on same date but >23h apart (simulates clock skew)
         let events = vec![
-            ev(now - 24 * hour_ms, "early"),
-            ev(now - 24 * hour_ms + 23 * hour_ms + 60_000, "late"),
+            ev(base, "early"),
+            ev(base + 23 * hour_ms + 60_000, "late"), // 23h01m later, still Jan 1
         ];
-        let batches = seal_batches(events, "/grp", "/s", None, now);
+        let batches = seal_batches(events, "/grp", "device", None, base + 24 * hour_ms);
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].events[0].message, "early");
         assert_eq!(batches[1].events[0].message, "late");
@@ -655,5 +693,36 @@ mod tests {
         let batches = seal_batches(events, "/grp", "/s", Some(LogLevel::Debug), now);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].events.len(), 1);
+    }
+
+    #[test]
+    fn test_stream_for_timestamp_format() {
+        // 2024-01-01 00:00:00 UTC
+        assert_eq!(
+            stream_for_timestamp(1704067200000, "myThing"),
+            "/2024/01/01/thing/myThing"
+        );
+    }
+
+    #[test]
+    fn test_stream_for_timestamp_colon_replacement() {
+        assert_eq!(
+            stream_for_timestamp(1704067200000, "a:b:c"),
+            "/2024/01/01/thing/a+b+c"
+        );
+    }
+
+    #[test]
+    fn test_stream_for_timestamp_midnight_boundary() {
+        // 2024-01-01 23:59:59 UTC → still Jan 1
+        assert_eq!(
+            stream_for_timestamp(1704153599000, "d"),
+            "/2024/01/01/thing/d"
+        );
+        // 2024-01-02 00:00:00 UTC → Jan 2
+        assert_eq!(
+            stream_for_timestamp(1704153600000, "d"),
+            "/2024/01/02/thing/d"
+        );
     }
 }
