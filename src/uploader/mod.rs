@@ -98,7 +98,7 @@ pub struct UploadResult {
 pub async fn upload_source_events(
     client: &mut CwLogsClient,
     log_group: &str,
-    log_stream: &str,
+    thing_name: &str,
     file_events: Vec<(PathBuf, Vec<LogEvent>, u64, String)>, // (path, events, new_offset, hash)
     min_log_level: Option<LogLevel>,
 ) -> UploadResult {
@@ -125,7 +125,7 @@ pub async fn upload_source_events(
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before Unix epoch")
         .as_millis() as i64;
-    let batches = seal_batches(all_events, log_group, log_stream, min_log_level, now_ms);
+    let batches = seal_batches(all_events, log_group, thing_name, min_log_level, now_ms);
 
     // Upload each batch
     let mut all_ok = true;

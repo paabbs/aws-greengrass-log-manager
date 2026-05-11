@@ -53,11 +53,12 @@ fn event_wire_size(message_bytes: usize) -> usize {
 ///
 /// Events are sorted by timestamp, filtered by age and log level,
 /// oversized events are chunked, and batches are sealed at CW API limits.
+/// Stream name is derived from each event's timestamp (matching Java's per-event date routing).
 #[must_use]
 pub fn seal_batches(
     mut events: Vec<LogEvent>,
     log_group: &str,
-    log_stream: &str,
+    thing_name: &str,
     min_log_level: Option<LogLevel>,
     now_ms: i64,
 ) -> Vec<SealedBatch> {
@@ -72,21 +73,7 @@ pub fn seal_batches(
     let mut current_events: Vec<LogEvent> = Vec::new();
     let mut current_size: usize = 0;
     let mut earliest_ts: Option<i64> = None;
-
-    let seal_current = |events: &mut Vec<LogEvent>,
-                        size: &mut usize,
-                        earliest: &mut Option<i64>,
-                        batches: &mut Vec<SealedBatch>| {
-        if !events.is_empty() {
-            batches.push(SealedBatch {
-                log_group: log_group.to_string(),
-                log_stream: log_stream.to_string(),
-                events: std::mem::take(events),
-            });
-            *size = 0;
-            *earliest = None;
-        }
-    };
+    let mut current_stream: String = String::new();
 
     for event in events {
         // Drop events outside CW allowed range
@@ -119,37 +106,53 @@ pub fn seal_batches(
                 continue;
             }
 
+            let chunk_stream = stream_for_timestamp(chunk.timestamp, thing_name);
             let wire_size = event_wire_size(chunk.message.len());
+
+            // Seal on stream change (date boundary)
+            if !current_events.is_empty() && chunk_stream != current_stream {
+                batches.push(SealedBatch {
+                    log_group: log_group.to_string(),
+                    log_stream: current_stream.clone(),
+                    events: std::mem::take(&mut current_events),
+                });
+                current_size = 0;
+                earliest_ts = None;
+            }
+            current_stream = chunk_stream;
 
             // Check 23-hour span
             let earliest = earliest_ts.unwrap_or(chunk.timestamp);
-            if chunk.timestamp - earliest > MAX_TIME_SPAN_MS {
-                seal_current(
-                    &mut current_events,
-                    &mut current_size,
-                    &mut earliest_ts,
-                    &mut batches,
-                );
+            if chunk.timestamp - earliest > MAX_TIME_SPAN_MS && !current_events.is_empty() {
+                batches.push(SealedBatch {
+                    log_group: log_group.to_string(),
+                    log_stream: current_stream.clone(),
+                    events: std::mem::take(&mut current_events),
+                });
+                current_size = 0;
+                earliest_ts = None;
             }
 
             // Check event count limit
             if current_events.len() >= MAX_NUM_OF_LOG_EVENTS {
-                seal_current(
-                    &mut current_events,
-                    &mut current_size,
-                    &mut earliest_ts,
-                    &mut batches,
-                );
+                batches.push(SealedBatch {
+                    log_group: log_group.to_string(),
+                    log_stream: current_stream.clone(),
+                    events: std::mem::take(&mut current_events),
+                });
+                current_size = 0;
+                earliest_ts = None;
             }
 
             // Check batch size limit
-            if current_size + wire_size > MAX_BATCH_SIZE {
-                seal_current(
-                    &mut current_events,
-                    &mut current_size,
-                    &mut earliest_ts,
-                    &mut batches,
-                );
+            if current_size + wire_size > MAX_BATCH_SIZE && !current_events.is_empty() {
+                batches.push(SealedBatch {
+                    log_group: log_group.to_string(),
+                    log_stream: current_stream.clone(),
+                    events: std::mem::take(&mut current_events),
+                });
+                current_size = 0;
+                earliest_ts = None;
             }
 
             if earliest_ts.is_none() {
@@ -160,14 +163,31 @@ pub fn seal_batches(
         }
     }
 
-    seal_current(
-        &mut current_events,
-        &mut current_size,
-        &mut earliest_ts,
-        &mut batches,
-    );
+    if !current_events.is_empty() {
+        batches.push(SealedBatch {
+            log_group: log_group.to_string(),
+            log_stream: current_stream,
+            events: current_events,
+        });
+    }
 
     batches
+}
+
+/// Derive log stream name from an event's timestamp (UTC date).
+/// Format: /{yyyy}/{MM}/{dd}/thing/{thingName}
+/// Matches Java LogManager's per-event stream naming.
+fn stream_for_timestamp(timestamp_ms: i64, thing_name: &str) -> String {
+    let dt = time::OffsetDateTime::from_unix_timestamp(timestamp_ms / 1000)
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let safe_name = thing_name.replace(':', "+");
+    format!(
+        "/{}/{:02}/{:02}/thing/{}",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        safe_name
+    )
 }
 
 /// Split a message into chunks of at most MAX_EVENT_BYTES bytes.
@@ -559,14 +579,12 @@ mod tests {
 
     #[test]
     fn test_23h_span_exact_same_batch() {
-        let now = now_ms();
         let hour_ms = 60 * 60 * 1000;
-        // Exactly 23h span — strict > means these stay in SAME batch
-        let events = vec![
-            ev(now - 24 * hour_ms, "early"),
-            ev(now - 24 * hour_ms + 23 * hour_ms, "late"),
-        ];
-        let batches = seal_batches(events, "/grp", "/s", None, now);
+        // Events on the same UTC date, exactly 23h apart — stay in SAME batch
+        // Use a fixed date to avoid midnight edge cases
+        let base = 1704067200000_i64; // 2024-01-01 00:00:00 UTC
+        let events = vec![ev(base, "early"), ev(base + 23 * hour_ms, "late")];
+        let batches = seal_batches(events, "/grp", "device", None, base + 24 * hour_ms);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].events.len(), 2);
     }

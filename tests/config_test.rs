@@ -27,6 +27,7 @@ const TEST_CONFIG_JSON: &str = r#"{
             "minimumLogLevel": "DEBUG",
             "diskSpaceLimit": "100",
             "diskSpaceLimitUnit": "MB",
+            "deleteLogFileAfterCloudUpload": "true",
             "uploadIntervalSec": 60
         },
         "com.example.EMFApp": {
@@ -42,6 +43,7 @@ const TEST_CONFIG_JSON: &str = r#"{
         "logGroupName": "/aws/greengrass/system/syslog",
         "diskSpaceLimit": "50",
         "diskSpaceLimitUnit": "GB",
+        "deleteLogFileAfterCloudUpload": "true",
         "minimumLogLevel": "WARN",
         "uploadIntervalSec": 120
     }
@@ -80,6 +82,8 @@ fn test_component_config_fields() {
     assert_eq!(comp.source.disk_space_limit_unit, DiskSpaceLimitUnit::MB);
     assert!(!comp.source.delete_log_file_after_cloud_upload);
     assert!(comp.log_group_name.is_none());
+    assert!(comp.source.multi_line_start_pattern.is_none());
+    assert!(comp.source.upload_interval_sec.is_none());
 }
 
 #[test]
@@ -97,6 +101,7 @@ fn test_upload_interval_override() {
         Some("/custom/nucleus/logs".to_string())
     );
     assert_eq!(nucleus.source.minimum_log_level, LogLevel::Debug);
+    assert!(nucleus.source.delete_log_file_after_cloud_upload);
 }
 
 #[test]
@@ -130,8 +135,11 @@ fn test_system_config_fields() {
         sys.log_group_name.as_deref(),
         Some("/aws/greengrass/system/syslog")
     );
+    assert_eq!(sys.source.log_file_directory_path, "/tmp");
+    assert_eq!(sys.source.log_file_regex, "syslog.*");
     assert_eq!(sys.source.disk_space_limit, Some("50".into()));
     assert_eq!(sys.source.disk_space_limit_unit, DiskSpaceLimitUnit::GB);
+    assert!(sys.source.delete_log_file_after_cloud_upload);
     assert_eq!(sys.source.minimum_log_level, LogLevel::Warn);
     assert_eq!(sys.source.upload_interval_sec, Some(120));
 }
@@ -275,4 +283,11 @@ fn test_legacy_list_format() {
         .logs_uploader_configuration
         .component_logs_configuration_map
         .contains_key("MyApp"));
+    let comp = config
+        .logs_uploader_configuration
+        .component_logs_configuration_map
+        .get("MyApp")
+        .unwrap();
+    assert_eq!(comp.source.log_file_directory_path, "/tmp");
+    assert_eq!(comp.source.log_file_regex, ".*\\.log");
 }

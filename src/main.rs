@@ -15,8 +15,8 @@ use gg_log_manager::scanner::{
     scan_directory, trim_stale_on_load, CheckpointStore, ScannedFile,
 };
 use gg_log_manager::uploader::{
-    advance_checkpoints, effective_interval_secs, evict_stale_entries, format_log_stream_name,
-    upload_source_events, CwLogsClient, TTL_24H_MS,
+    advance_checkpoints, effective_interval_secs, evict_stale_entries, upload_source_events,
+    CwLogsClient, TTL_24H_MS,
 };
 
 use regex::Regex;
@@ -385,9 +385,6 @@ async fn upload_and_advance_checkpoints(
     scanned_files: &[ScannedFile],
     file_events: Vec<(PathBuf, Vec<gg_log_manager::scanner::LogEvent>, u64, String)>,
 ) {
-    // Format log stream name
-    let log_stream = format_log_stream_name(thing_name);
-
     // Upload
     let min_level = if matches!(
         source.minimum_log_level,
@@ -398,7 +395,7 @@ async fn upload_and_advance_checkpoints(
         Some(source.minimum_log_level)
     };
 
-    let result = upload_source_events(client, log_group, &log_stream, file_events, min_level).await;
+    let result = upload_source_events(client, log_group, thing_name, file_events, min_level).await;
 
     // Advance checkpoints for succeeded files
     if !result.succeeded.is_empty() {
