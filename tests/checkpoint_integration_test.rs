@@ -103,7 +103,8 @@ fn test_checkpoint_stale_entry_removed_after_file_deleted() {
     assert_eq!(offsets.len(), 1);
     assert_eq!(offsets[0].1, 100);
 
-    // Deleted file's checkpoint entry is evicted
+    // Deleted file's entry is preserved — eviction now happens in upload path (TTL-based)
+    // not during scan.
     let remaining = loaded.file_processing_info.get("test-group").unwrap();
-    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining.len(), 2);
 }

@@ -4,7 +4,7 @@
 //! Checkpoint persistence with atomic writes and restart recovery.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -148,7 +148,6 @@ pub fn trim_stale_on_load(store: &mut CheckpointStore) {
 /// Recover file offsets from checkpoint for restart recovery.
 /// Returns (file_path, resume_offset) pairs for each scanned file.
 /// Updates last_accessed on read (touch-on-read).
-/// Evicts entries for files no longer on disk (see DIVERGENCE comment in body).
 ///
 /// The caller must pass ALL files for the component in a single call.
 /// One directory per component — the config schema enforces this.
@@ -158,10 +157,6 @@ pub fn recover_offsets(
     log_group_key: &str,
     scanned_files: &[ScannedFile],
 ) -> Vec<(PathBuf, u64)> {
-    let current_hashes: HashSet<&str> = scanned_files
-        .iter()
-        .map(|f| f.content_hash.as_str())
-        .collect();
     let now = now_ms();
 
     let result: Vec<(PathBuf, u64)> = scanned_files
@@ -188,19 +183,8 @@ pub fn recover_offsets(
         })
         .collect();
 
-    // DIVERGENCE: Java evicts via TTL on every put() call (triggered by upload
-    // callbacks) and explicitly via deleteFileFromGroup() on completed files.
-    // We evict on scan because the upload path doesn't exist yet.
-    // Move to upload path when batcher lands.
-    if let Some(file_map) = checkpoint.file_processing_info.get_mut(log_group_key) {
-        file_map.retain(|hash, _| {
-            let keep = current_hashes.contains(hash.as_str());
-            if !keep {
-                tracing::debug!("Evicting checkpoint for hash {}", hash);
-            }
-            keep
-        });
-    }
+    // Eviction of stale/completed entries is handled by the upload orchestrator
+    // after confirmed upload (uploader::evict_stale_entries + advance_checkpoints).
 
     result
 }
@@ -394,7 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn test_recover_offsets_removes_stale() {
+    fn test_recover_offsets_preserves_entries_for_missing_files() {
+        // Eviction of entries for files no longer on disk is now handled by the
+        // upload orchestrator (evict_stale_entries) after confirmed upload.
         let mut store = CheckpointStore::default();
         let mut files = HashMap::new();
         files.insert(
@@ -428,10 +414,11 @@ mod tests {
 
         let _ = recover_offsets(&mut store, "test-group", &scanned);
 
+        // Both entries preserved — eviction happens in upload path, not scan
         let remaining = store.file_processing_info.get("test-group").unwrap();
-        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.len(), 2);
         assert!(remaining.contains_key("current_hash"));
-        assert!(!remaining.contains_key("stale_hash"));
+        assert!(remaining.contains_key("stale_hash"));
     }
 
     #[test]

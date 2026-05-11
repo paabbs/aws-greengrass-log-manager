@@ -10,7 +10,7 @@ use aws_sdk_cloudwatchlogs::{
 use std::collections::HashSet;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CwUploadError {
+pub enum CwUploadError {
     #[error("authentication error")]
     AuthError,
     #[error("retriable: {0}")]
@@ -19,7 +19,7 @@ pub(crate) enum CwUploadError {
     Other(String),
 }
 
-pub(crate) struct CwLogsClient {
+pub struct CwLogsClient {
     client: Client,
     config: aws_sdk_cloudwatchlogs::Config,
     created_groups: HashSet<String>,
@@ -43,8 +43,8 @@ impl CwLogsClient {
         }
     }
 
-    #[cfg(test)]
-    fn new_with_client(client: Client, config: aws_sdk_cloudwatchlogs::Config) -> Self {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_with_client(client: Client, config: aws_sdk_cloudwatchlogs::Config) -> Self {
         Self {
             client,
             config,
@@ -56,11 +56,11 @@ impl CwLogsClient {
     /// Recreate the SDK client (e.g., after persistent network errors).
     /// Caches are preserved — if a resource was deleted externally, the next
     /// put_log_events will get ResourceNotFoundException which clears the cache.
-    pub(crate) fn recreate_client(&mut self) {
+    pub fn recreate_client(&mut self) {
         self.client = Client::from_conf(self.config.clone());
     }
 
-    pub(crate) async fn upload_batch(&mut self, batch: &SealedBatch) -> Result<(), CwUploadError> {
+    pub async fn upload_batch(&mut self, batch: &SealedBatch) -> Result<(), CwUploadError> {
         if batch.events.is_empty() {
             return Ok(());
         }
