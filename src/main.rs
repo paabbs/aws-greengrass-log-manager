@@ -54,14 +54,16 @@ async fn main() {
     }
 
     info!(
-        components = config
+        components = ?config
             .logs_uploader_configuration
             .component_logs_configuration_map
-            .len(),
-        system = config
+            .keys()
+            .collect::<Vec<_>>(),
+        system_logs = config
             .logs_uploader_configuration
             .system_logs_configuration
             .is_some(),
+        interval_sec = config.periodic_upload_interval_sec,
         "Configuration loaded"
     );
 
@@ -73,10 +75,11 @@ async fn main() {
 
     // Checkpoint loading
     let checkpoint_path = Path::new(&work_dir).join("checkpoint.json");
-    let mut store = load_checkpoint(&checkpoint_path).unwrap_or_else(|e| {
-        error!("Failed to load checkpoint: {e}, starting fresh");
-        CheckpointStore::default()
-    });
+    let mut store = load_checkpoint(&checkpoint_path, config.deprecated_version_support)
+        .unwrap_or_else(|e| {
+            error!("Failed to load checkpoint: {e}, starting fresh");
+            CheckpointStore::default()
+        });
     trim_stale_on_load(&mut store);
 
     // CW client initialization
@@ -115,7 +118,9 @@ async fn main() {
 
         // Rate-limited checkpoint persistence
         if last_persist.elapsed() >= persist_interval {
-            if let Err(e) = save_checkpoint(&checkpoint_path, &store) {
+            if let Err(e) =
+                save_checkpoint(&checkpoint_path, &store, config.deprecated_version_support)
+            {
                 error!("Failed to persist checkpoint: {e}");
             }
             last_persist = Instant::now();
@@ -131,7 +136,7 @@ async fn main() {
 
     // Graceful shutdown: persist checkpoint unconditionally
     info!("Shutting down — persisting final checkpoint");
-    if let Err(e) = save_checkpoint(&checkpoint_path, &store) {
+    if let Err(e) = save_checkpoint(&checkpoint_path, &store, config.deprecated_version_support) {
         error!("Failed to persist checkpoint on shutdown: {e}");
     }
     info!("Shutdown complete");
@@ -205,19 +210,19 @@ async fn process_source(
     store: &mut CheckpointStore,
     thing_name: &str,
 ) {
-    // Phase 1: Scan and filter files
+    // Scan and filter files
     let scanned_files = match scan_and_filter_files(source, log_group, pattern, store) {
         Some(files) => files,
         None => return,
     };
 
-    // Phase 2: Read file events
+    // Read file events
     let file_events = read_file_events(source, log_group, &scanned_files, store);
     if file_events.is_empty() {
         return;
     }
 
-    // Phase 3: Upload and advance checkpoints
+    // Upload, advance checkpoints, and enforce disk limits
     upload_and_advance_checkpoints(
         source,
         log_group,
@@ -231,7 +236,9 @@ async fn process_source(
     .await;
 }
 
-/// Phase 1: Scan directory and filter files by timestamp.
+/// Scans the configured log directory for files matching the regex pattern,
+/// then filters out files that have already been fully uploaded (based on
+/// last_processed_timestamps) to avoid re-processing.
 fn scan_and_filter_files(
     source: &LogSourceConfig,
     log_group: &str,
@@ -279,7 +286,8 @@ fn scan_and_filter_files(
     Some(scanned_files)
 }
 
-/// Phase 2: Read new content from files and assemble multiline events.
+/// Reads new content from each scanned file starting at the checkpointed byte
+/// offset, then assembles multi-line log entries if a pattern is configured.
 fn read_file_events(
     source: &LogSourceConfig,
     log_group: &str,
@@ -372,7 +380,9 @@ fn read_file_events(
     file_events
 }
 
-/// Phase 3: Upload events, advance checkpoints, enforce disk limits.
+/// Uploads batched log events to CloudWatch, advances checkpoint offsets for
+/// successfully uploaded files, deletes completed files if configured, and
+/// enforces disk space limits by removing fully-uploaded files when over threshold.
 #[cfg(not(tarpaulin_include))]
 #[allow(clippy::too_many_arguments)]
 async fn upload_and_advance_checkpoints(
@@ -414,32 +424,42 @@ async fn upload_and_advance_checkpoints(
                 }
             }
         }
-    }
 
-    // Disk space enforcement — runs every cycle regardless of upload success.
-    // Per AWS docs: "deletes the oldest log files" when diskSpaceLimit is exceeded.
-    // This includes non-active files that haven't been uploaded yet — protecting the
-    // device from disk exhaustion when offline at the cost of potential data loss.
-    if let Some(limit_str) = source.disk_space_limit.as_deref() {
-        if let Ok(limit_val) = limit_str.parse::<u64>() {
-            let limit_bytes = source.disk_space_limit_unit.to_bytes(limit_val);
-            let all_eligible: Vec<PathBuf> = scanned_files
-                .iter()
-                .filter(|f| !f.is_active)
-                .map(|f| f.path.clone())
-                .collect();
-            let deleted = gg_log_manager::disk::free_disk_space(
-                Path::new(&source.log_file_directory_path),
-                pattern,
-                limit_bytes,
-                &all_eligible,
-            );
-            // Remove deleted files' hashes from checkpoint
-            if !deleted.is_empty() {
-                if let Some(file_map) = store.file_processing_info.get_mut(log_group) {
-                    for del_path in &deleted {
-                        if let Some(sf) = scanned_files.iter().find(|f| f.path == *del_path) {
-                            file_map.remove(&sf.content_hash);
+        // Disk space enforcement — only after successful upload, only deletes
+        // fully-uploaded files
+        if let Some(limit_str) = source.disk_space_limit.as_deref() {
+            if let Ok(limit_val) = limit_str.parse::<u64>() {
+                let limit_bytes = source.disk_space_limit_unit.to_bytes(limit_val);
+                let last_ts = store
+                    .last_processed_timestamps
+                    .get(log_group)
+                    .map(|t| t.last_file_processed_time_stamp)
+                    .unwrap_or(0);
+                let all_eligible: Vec<PathBuf> = scanned_files
+                    .iter()
+                    .filter(|f| !f.is_active)
+                    .filter(|f| {
+                        let mtime_ms = f
+                            .mtime
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        mtime_ms <= last_ts
+                    })
+                    .map(|f| f.path.clone())
+                    .collect();
+                let deleted = gg_log_manager::disk::free_disk_space(
+                    Path::new(&source.log_file_directory_path),
+                    pattern,
+                    limit_bytes,
+                    &all_eligible,
+                );
+                if !deleted.is_empty() {
+                    if let Some(file_map) = store.file_processing_info.get_mut(log_group) {
+                        for del_path in &deleted {
+                            if let Some(sf) = scanned_files.iter().find(|f| f.path == *del_path) {
+                                file_map.remove(&sf.content_hash);
+                            }
                         }
                     }
                 }

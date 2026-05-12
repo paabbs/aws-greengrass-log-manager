@@ -4,6 +4,7 @@
 //! Integration tests for the upload orchestrator — verifies Java behavioral parity.
 
 use gg_log_manager::config::LogLevel;
+use gg_log_manager::disk::free_disk_space;
 use gg_log_manager::scanner::{
     assemble_multiline, load_checkpoint, read_file_from_offset, recover_offsets, save_checkpoint,
     scan_directory, CheckpointStore, FileCheckpoint,
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
-use tempfile::TempDir;
+use tempfile::{tempdir, TempDir};
 
 fn emf_pattern() -> Regex {
     Regex::new(r".*\.emf\.json$").unwrap()
@@ -160,10 +161,10 @@ fn test_restart_recovery_no_duplicates() {
     advance_checkpoints(&mut store, "grp", &succeeded, &scanned);
 
     // Persist checkpoint
-    save_checkpoint(&checkpoint_path, &store).unwrap();
+    save_checkpoint(&checkpoint_path, &store, false).unwrap();
 
     // "Restart" — reload checkpoint
-    let mut loaded = load_checkpoint(&checkpoint_path).unwrap();
+    let mut loaded = load_checkpoint(&checkpoint_path, false).unwrap();
     let scanned2 = scan_directory(dir.path().to_str().unwrap(), &pattern).unwrap();
     let offsets2 = recover_offsets(&mut loaded, "grp", &scanned2);
 
@@ -287,9 +288,9 @@ fn test_upload_failure_no_checkpoint_advance() {
     assert!(new_offset > 0);
 
     // Simulate upload FAILURE — do NOT call advance_checkpoints
-    save_checkpoint(&checkpoint_path, &store).unwrap();
+    save_checkpoint(&checkpoint_path, &store, false).unwrap();
 
-    let mut loaded = load_checkpoint(&checkpoint_path).unwrap();
+    let mut loaded = load_checkpoint(&checkpoint_path, false).unwrap();
     let scanned2 = scan_directory(dir.path().to_str().unwrap(), &pattern).unwrap();
     let offsets2 = recover_offsets(&mut loaded, "grp", &scanned2);
 
@@ -399,9 +400,9 @@ fn test_shutdown_saves_checkpoint() {
     );
     store.file_processing_info.insert("grp".to_string(), files);
 
-    save_checkpoint(&checkpoint_path, &store).unwrap();
+    save_checkpoint(&checkpoint_path, &store, false).unwrap();
 
-    let loaded = load_checkpoint(&checkpoint_path).unwrap();
+    let loaded = load_checkpoint(&checkpoint_path, false).unwrap();
     let cp = loaded
         .file_processing_info
         .get("grp")
@@ -649,4 +650,74 @@ fn test_disk_space_uses_all_fully_uploaded_files() {
     assert_eq!(all_processed.len(), 2);
     assert!(all_processed.contains(&f1));
     assert!(all_processed.contains(&f2));
+}
+
+// --- Disk enforcement helpers ---
+
+fn create_file(dir: &std::path::Path, name: &str, size: u64) -> PathBuf {
+    let path = dir.join(name);
+    let f = File::create(&path).unwrap();
+    f.set_len(size).unwrap();
+    path
+}
+
+fn set_mtime(path: &std::path::Path, secs_ago: i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let t = filetime::FileTime::from_unix_time(now - secs_ago, 0);
+    filetime::set_file_mtime(path, t).unwrap();
+}
+
+// --- T17: Disk enforcement only deletes fully-uploaded files ---
+
+/// The caller filters the list before passing to free_disk_space.
+#[test]
+fn test_disk_enforcement_only_deletes_uploaded_files() {
+    let dir = tempdir().unwrap();
+
+    // A = old, fully uploaded; B = partially uploaded; C = active (newest)
+    let file_a = create_file(dir.path(), "a.log", 200);
+    let file_b = create_file(dir.path(), "b.log", 200);
+    let file_c = create_file(dir.path(), "c.log", 200);
+    set_mtime(&file_a, 300); // oldest
+    set_mtime(&file_b, 200);
+    set_mtime(&file_c, 100); // newest = active
+
+    // Total = 600 bytes, limit = 300 → need to free 300
+    // Only file_a is in the processed list (simulating caller filtering:
+    // fully uploaded, mtime <= last_processed_ts, not active)
+    let processed = vec![file_a.clone()];
+
+    let deleted = free_disk_space(dir.path(), &log_pattern(), 300, &processed);
+
+    assert_eq!(deleted, vec![file_a.clone()]);
+    assert!(!file_a.exists(), "fully uploaded file should be deleted");
+    assert!(file_b.exists(), "partially uploaded file must remain");
+    assert!(file_c.exists(), "active file must remain");
+}
+
+// --- T18: Disk enforcement skipped when upload fails ---
+
+/// The caller passes an empty processed list when upload failed.
+#[test]
+fn test_disk_enforcement_skipped_when_no_upload_success() {
+    let dir = tempdir().unwrap();
+
+    // Create files well over the limit
+    let file_a = create_file(dir.path(), "a.log", 500);
+    let file_b = create_file(dir.path(), "b.log", 500);
+    set_mtime(&file_a, 200);
+    set_mtime(&file_b, 100);
+
+    // Total = 1000, limit = 100 → way over, but empty succeeded list
+    let deleted = free_disk_space(dir.path(), &log_pattern(), 100, &[]);
+
+    assert!(
+        deleted.is_empty(),
+        "no files should be deleted when upload failed"
+    );
+    assert!(file_a.exists());
+    assert!(file_b.exists());
 }

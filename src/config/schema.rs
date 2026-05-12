@@ -117,6 +117,8 @@ pub struct LogsUploaderConfig {
 pub struct LogManagerConfig {
     pub logs_uploader_configuration: LogsUploaderConfig,
     pub periodic_upload_interval_sec: u64,
+    /// Whether to support deprecated V1 checkpoint format (Java ≤ 2.3.0). Default: true.
+    pub deprecated_version_support: bool,
 }
 
 impl<'de> Deserialize<'de> for LogManagerConfig {
@@ -143,9 +145,18 @@ impl<'de> Deserialize<'de> for LogManagerConfig {
             serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?
         };
 
+        let deprecated_version_support = obj
+            .get("deprecatedVersionSupport")
+            .and_then(|v| {
+                v.as_bool()
+                    .or_else(|| v.as_str().map(|s| s.eq_ignore_ascii_case("true")))
+            })
+            .unwrap_or(true);
+
         Ok(LogManagerConfig {
             logs_uploader_configuration: uploader_config,
             periodic_upload_interval_sec: periodic,
+            deprecated_version_support,
         })
     }
 }
@@ -308,6 +319,7 @@ mod tests {
                 component_logs_configuration_map: map,
                 system_logs_configuration: None,
             },
+            deprecated_version_support: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: LogManagerConfig = serde_json::from_str(&json).unwrap();

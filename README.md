@@ -14,18 +14,12 @@ Supports multi-line log assembly, EMF JSON passthrough, and minimumLogLevel filt
 Greengrass logs.
 
 **Checkpoint Persistence** — Tracks per-file read offsets using content-hash-based file identity (survives
-log rotation). Atomic checkpoint writes with fsync for crash safety. Compatible with Java LogManager v2.3.1+
-checkpoint format for seamless upgrades.
+log rotation). Atomic checkpoint writes with fsync for crash safety. Supports both current and deprecated
+checkpoint formats (controlled by `deprecatedVersionSupport` configuration).
 
-**Disk Space Management** — Enforces per-source disk limits by deleting oldest non-active files
-when the configured `diskSpaceLimit` is exceeded. Runs every upload cycle regardless of connectivity.
+**Disk Space Management** — Enforces per-source disk limits by deleting oldest fully-uploaded files
+when the configured `diskSpaceLimit` is exceeded after a successful upload cycle.
 Supports `deleteLogFileAfterCloudUpload` for automatic cleanup of successfully uploaded files.
-
-> **⚠️ Data loss note:** Enforces `diskSpaceLimit` when the device is offline as well as mentioned in the
-> [documented behavior](https://docs.aws.amazon.com/greengrass/v2/developerguide/log-manager-component.html):
-> "deletes the oldest log files" when the limit is exceeded. Unuploaded data may be lost if the
-> disk limit is reached while offline. The configured limit takes priority over data retention
-> to protect the device from disk exhaustion.
 
 ### Sample Configuration
 

@@ -8,6 +8,13 @@ use aws_sdk_cloudwatchlogs::{
     error::SdkError, operation::put_log_events::PutLogEventsError, types::InputLogEvent, Client,
 };
 use std::collections::HashSet;
+use std::time::Duration;
+use tokio::time::sleep;
+
+/// Backoff delays in seconds for app-level retries.
+const BACKOFF_DELAYS: [u64; 3] = [2, 4, 8];
+/// Max app-level retries — derived from BACKOFF_DELAYS length.
+const MAX_APP_RETRIES: usize = BACKOFF_DELAYS.len();
 
 #[derive(Debug, thiserror::Error)]
 pub enum CwUploadError {
@@ -17,6 +24,14 @@ pub enum CwUploadError {
     Retriable(String),
     #[error("{0}")]
     Other(String),
+}
+
+/// Outcome of an upload attempt with retry.
+pub enum UploadOutcome {
+    /// All events uploaded successfully.
+    Success,
+    /// Retries exhausted — retriable error persisted.
+    RetriesExhausted,
 }
 
 pub struct CwLogsClient {
@@ -68,6 +83,38 @@ impl CwLogsClient {
         self.ensure_log_stream(&batch.log_group, &batch.log_stream)
             .await?;
         self.put_log_events(batch).await
+    }
+
+    /// Upload a batch with app-level retry for retriable errors.
+    /// SDK already retries 5 times internally for transient HTTP errors.
+    ///
+    /// # Errors
+    /// Returns `Err(CwUploadError::AuthError)` if credentials are invalid (non-retriable).
+    pub async fn upload_batch_with_retry(
+        &mut self,
+        batch: &SealedBatch,
+    ) -> Result<UploadOutcome, CwUploadError> {
+        for (attempt, delay) in BACKOFF_DELAYS.iter().enumerate() {
+            match self.upload_batch(batch).await {
+                Ok(()) => return Ok(UploadOutcome::Success),
+                Err(CwUploadError::AuthError) => {
+                    return Err(CwUploadError::AuthError);
+                }
+                Err(CwUploadError::Other(msg)) => {
+                    tracing::error!(log_group = %batch.log_group, error = %msg, "Non-retriable upload error");
+                    return Ok(UploadOutcome::RetriesExhausted);
+                }
+                Err(CwUploadError::Retriable(msg)) => {
+                    if attempt >= MAX_APP_RETRIES - 1 {
+                        tracing::error!(log_group = %batch.log_group, attempts = MAX_APP_RETRIES, error = %msg, "Upload failed after all retries");
+                        return Ok(UploadOutcome::RetriesExhausted);
+                    }
+                    tracing::warn!(log_group = %batch.log_group, attempt = attempt + 1, delay_s = delay, error = %msg, "Retriable error, backing off");
+                    sleep(Duration::from_secs(*delay)).await;
+                }
+            }
+        }
+        Ok(UploadOutcome::RetriesExhausted)
     }
 
     async fn ensure_log_group(&mut self, log_group: &str) -> Result<(), CwUploadError> {

@@ -10,6 +10,7 @@ ComponentDependencies:
     DependencyType: HARD
 ComponentConfiguration:
   DefaultConfiguration:
+    deprecatedVersionSupport: "true"
     logsUploaderConfiguration:
       systemLogsConfiguration:
         uploadToCloudWatch: "false"

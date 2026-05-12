@@ -23,46 +23,9 @@ pub struct SealedBatch {
 }
 
 #[cfg(feature = "aws-sdk")]
-pub use cw_client::{CwLogsClient, CwUploadError};
+pub use cw_client::{CwLogsClient, CwUploadError, UploadOutcome};
 
 pub use batcher::{seal_batches, MAX_EVENT_BYTES};
-
-// --- Retry ---
-
-/// Max app-level retries for Retriable errors (SDK already retried 5 times internally).
-const MAX_APP_RETRIES: usize = 3;
-/// Backoff delays in seconds for app-level retries.
-const BACKOFF_DELAYS: [u64; 3] = [2, 4, 8];
-
-/// Upload a single batch with app-level retry for Retriable errors.
-/// Returns Ok(true) on success, Ok(false) if retries exhausted, Err on non-retriable.
-#[cfg(feature = "aws-sdk")]
-pub async fn upload_with_retry(
-    client: &mut CwLogsClient,
-    batch: &SealedBatch,
-) -> Result<bool, String> {
-    for (attempt, delay) in BACKOFF_DELAYS.iter().enumerate() {
-        match client.upload_batch(batch).await {
-            Ok(()) => return Ok(true),
-            Err(CwUploadError::AuthError) => {
-                return Err("Authentication error — credentials invalid".to_string());
-            }
-            Err(CwUploadError::Other(msg)) => {
-                tracing::error!(log_group = %batch.log_group, error = %msg, "Non-retriable upload error");
-                return Ok(false);
-            }
-            Err(CwUploadError::Retriable(msg)) => {
-                if attempt >= MAX_APP_RETRIES - 1 {
-                    tracing::error!(log_group = %batch.log_group, attempts = MAX_APP_RETRIES, error = %msg, "Upload failed after all retries");
-                    return Ok(false);
-                }
-                tracing::warn!(log_group = %batch.log_group, attempt = attempt + 1, delay_s = delay, error = %msg, "Retriable error, backing off");
-                tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
-            }
-        }
-    }
-    Ok(false)
-}
 
 // --- Scheduling ---
 
@@ -130,9 +93,9 @@ pub async fn upload_source_events(
     // Upload each batch
     let mut all_ok = true;
     for batch in &batches {
-        match upload_with_retry(client, batch).await {
-            Ok(true) => {}
-            Ok(false) => {
+        match client.upload_batch_with_retry(batch).await {
+            Ok(cw_client::UploadOutcome::Success) => {}
+            Ok(cw_client::UploadOutcome::RetriesExhausted) => {
                 all_ok = false;
                 break;
             }
@@ -171,6 +134,13 @@ fn now_ms() -> u64 {
 /// A file is "completed" when: `!is_active && file_length == new_offset`.
 /// Completed files are removed from the checkpoint
 /// Partial files get their `start_position` updated.
+/// A file is fully uploaded when all bytes have been read, it's not the active
+/// (currently written-to) file, and it's non-empty.
+#[must_use]
+fn is_file_fully_uploaded(is_active: bool, file_len: u64, bytes_read: u64) -> bool {
+    !is_active && file_len == bytes_read && file_len > 0
+}
+
 pub fn advance_checkpoints(
     store: &mut CheckpointStore,
     log_group_key: &str,
@@ -193,7 +163,7 @@ pub fn advance_checkpoints(
         let is_active = scanned.is_some_and(|f| f.is_active);
         let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-        if !is_active && file_len == *new_offset && file_len > 0 {
+        if is_file_fully_uploaded(is_active, file_len, *new_offset) {
             // File fully uploaded and not active → completed
             file_map.remove(content_hash);
             completed.push(path.clone());
