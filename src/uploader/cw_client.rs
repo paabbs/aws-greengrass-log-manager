@@ -9,17 +9,42 @@ use aws_sdk_cloudwatchlogs::{
 };
 use std::collections::HashSet;
 
+/// Classification of a CloudWatch upload failure.
+///
+/// The split mirrors how `aws.greengrass.LogManager` reacts to upload failures:
+/// the AWS SDK already retries transient faults (throttling, `LimitExceeded`, 5xx,
+/// timeouts) internally via [`RetryConfig`], so the only fault worth a manual retry
+/// is a missing log group/stream — everything else is either fatal for this cycle or
+/// an auth problem the same credentials cannot fix.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CwUploadError {
+#[non_exhaustive]
+pub enum CwUploadError {
+    /// Authentication/authorization failure. Not retryable with the same credentials —
+    /// kept distinct so the caller can trigger a TES credential refresh.
     #[error("authentication error")]
-    AuthError,
-    #[error("retriable: {0}")]
-    Retriable(String),
+    Auth,
+    /// A fault the SDK does not retry but a single immediate re-attempt may clear —
+    /// notably `ResourceNotFoundException` (recreate the group/stream) or a raw
+    /// transport error surfacing after the SDK's own retries are exhausted.
+    #[error("retryable: {0}")]
+    Retryable(String),
+    /// A non-retryable failure for this cycle (invalid input, or a transient class the
+    /// SDK already retried and exhausted, e.g. throttling/`LimitExceeded`/5xx).
     #[error("{0}")]
-    Other(String),
+    Fatal(String),
 }
 
-pub(crate) struct CwLogsClient {
+/// Outcome of an upload attempt.
+#[derive(Debug)]
+pub enum UploadOutcome {
+    /// All events uploaded successfully.
+    Success,
+    /// A retryable fault persisted after the single re-attempt — the batch will be
+    /// retried on the next upload cycle.
+    RetriesExhausted,
+}
+
+pub struct CwLogsClient {
     client: Client,
     config: aws_sdk_cloudwatchlogs::Config,
     created_groups: HashSet<String>,
@@ -56,7 +81,7 @@ impl CwLogsClient {
     /// Recreate the SDK client (e.g., after persistent network errors).
     /// Caches are preserved — if a resource was deleted externally, the next
     /// put_log_events will get ResourceNotFoundException which clears the cache.
-    pub(crate) fn recreate_client(&mut self) {
+    pub fn recreate_client(&mut self) {
         self.client = Client::from_conf(self.config.clone());
     }
 
@@ -68,6 +93,47 @@ impl CwLogsClient {
         self.ensure_log_stream(&batch.log_group, &batch.log_stream)
             .await?;
         self.put_log_events(batch).await
+    }
+
+    /// Upload a batch, retrying exactly once for a retryable fault.
+    ///
+    /// The AWS SDK already retries throttling/`LimitExceeded`/5xx/timeouts internally
+    /// ([`RetryConfig`] with `max_attempts(5)`), so there is deliberately no app-level
+    /// sleep/backoff loop here. The single re-attempt exists for the one case the SDK
+    /// cannot handle: a missing log group/stream. On `ResourceNotFoundException`,
+    /// [`Self::put_log_events`] clears the resource cache, so re-running `upload_batch`
+    /// recreates the group/stream and re-sends once. This mirrors the Java
+    /// `aws.greengrass.LogManager` uploader, which recreates-then-retries on
+    /// `ResourceNotFound` and otherwise defers persistent failures to the next cycle.
+    ///
+    /// # Errors
+    /// Returns [`CwUploadError::Auth`] when credentials are invalid (non-retryable);
+    /// the caller stops processing the source so credentials can be refreshed.
+    pub(crate) async fn upload_batch_with_retry(
+        &mut self,
+        batch: &SealedBatch,
+    ) -> Result<UploadOutcome, CwUploadError> {
+        match self.upload_batch(batch).await {
+            Ok(()) => return Ok(UploadOutcome::Success),
+            Err(CwUploadError::Auth) => return Err(CwUploadError::Auth),
+            Err(CwUploadError::Fatal(msg)) => {
+                tracing::error!(log_group = %batch.log_group, error = %msg, "Non-retryable upload error");
+                return Ok(UploadOutcome::RetriesExhausted);
+            }
+            Err(CwUploadError::Retryable(msg)) => {
+                tracing::warn!(log_group = %batch.log_group, error = %msg, "Retryable error, recreating resources and retrying once");
+            }
+        }
+
+        // Single re-attempt, no sleep. Persistent failures wait for the next upload cycle.
+        match self.upload_batch(batch).await {
+            Ok(()) => Ok(UploadOutcome::Success),
+            Err(CwUploadError::Auth) => Err(CwUploadError::Auth),
+            Err(e) => {
+                tracing::error!(log_group = %batch.log_group, error = %e, "Upload failed after recreate retry");
+                Ok(UploadOutcome::RetriesExhausted)
+            }
+        }
     }
 
     async fn ensure_log_group(&mut self, log_group: &str) -> Result<(), CwUploadError> {
@@ -90,13 +156,13 @@ impl CwLogsClient {
                 self.created_groups.insert(log_group.to_string());
                 Ok(())
             }
+            // LimitExceeded is the SDK's job to retry; if it surfaces here the SDK has
+            // already exhausted its attempts, so treat it as fatal for this cycle.
             Err(SdkError::ServiceError(e)) if is_limit_exceeded_group(e.err()) => Err(
-                CwUploadError::Retriable("LimitExceededException on create_log_group".to_string()),
+                CwUploadError::Fatal("LimitExceededException on create_log_group".to_string()),
             ),
-            Err(SdkError::ServiceError(e)) if is_auth_error(e.err()) => {
-                Err(CwUploadError::AuthError)
-            }
-            Err(e) => Err(CwUploadError::Retriable(e.to_string())),
+            Err(SdkError::ServiceError(e)) if is_auth_error(e.err()) => Err(CwUploadError::Auth),
+            Err(e) => Err(CwUploadError::Retryable(e.to_string())),
         }
     }
 
@@ -127,12 +193,10 @@ impl CwLogsClient {
                 Ok(())
             }
             Err(SdkError::ServiceError(e)) if is_limit_exceeded_stream(e.err()) => Err(
-                CwUploadError::Retriable("LimitExceededException on create_log_stream".to_string()),
+                CwUploadError::Fatal("LimitExceededException on create_log_stream".to_string()),
             ),
-            Err(SdkError::ServiceError(e)) if is_auth_error(e.err()) => {
-                Err(CwUploadError::AuthError)
-            }
-            Err(e) => Err(CwUploadError::Retriable(e.to_string())),
+            Err(SdkError::ServiceError(e)) if is_auth_error(e.err()) => Err(CwUploadError::Auth),
+            Err(e) => Err(CwUploadError::Retryable(e.to_string())),
         }
     }
 
@@ -148,7 +212,7 @@ impl CwLogsClient {
             })
             .collect();
         let events =
-            events.map_err(|e| CwUploadError::Other(format!("Failed to build log event: {e}")))?;
+            events.map_err(|e| CwUploadError::Fatal(format!("Failed to build log event: {e}")))?;
 
         // EMF metrics are auto-extracted by CloudWatch when log events contain the _aws key.
         // No sequence tokens needed — deprecated since late 2023, and we create new streams daily.
@@ -172,32 +236,32 @@ impl CwLogsClient {
                     tracing::debug!(log_group = %batch.log_group, "Data already accepted");
                     Ok(())
                 }
-                PutLogEventsError::UnrecognizedClientException(_) => Err(CwUploadError::AuthError),
-                PutLogEventsError::ServiceUnavailableException(_) => Err(CwUploadError::Other(
+                PutLogEventsError::UnrecognizedClientException(_) => Err(CwUploadError::Auth),
+                PutLogEventsError::ServiceUnavailableException(_) => Err(CwUploadError::Fatal(
                     "ServiceUnavailable after SDK retries exhausted".to_string(),
                 )),
                 PutLogEventsError::ResourceNotFoundException(_) => {
-                    // Clear cache so next retry re-creates the group/stream
+                    // Clear cache so the single re-attempt recreates the group/stream.
                     self.created_groups.remove(&batch.log_group);
                     let key = format!("{}:{}", batch.log_group, batch.log_stream);
                     self.created_streams.remove(&key);
-                    Err(CwUploadError::Retriable("ResourceNotFound".to_string()))
+                    Err(CwUploadError::Retryable("ResourceNotFound".to_string()))
                 }
                 PutLogEventsError::InvalidParameterException(ex) => {
-                    Err(CwUploadError::Other(ex.to_string()))
+                    Err(CwUploadError::Fatal(ex.to_string()))
                 }
                 other => {
                     use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata;
                     if other.code() == Some("ThrottlingException") {
-                        Err(CwUploadError::Other(
+                        Err(CwUploadError::Fatal(
                             "Throttled after SDK retries exhausted".to_string(),
                         ))
                     } else {
-                        Err(CwUploadError::Other(other.to_string()))
+                        Err(CwUploadError::Fatal(other.to_string()))
                     }
                 }
             },
-            Err(e) => Err(CwUploadError::Retriable(e.to_string())),
+            Err(e) => Err(CwUploadError::Retryable(e.to_string())),
         }
     }
 
@@ -249,7 +313,7 @@ fn is_limit_exceeded_stream(
     err.code() == Some("LimitExceededException")
 }
 
-/// Auth errors are not retriable — same credentials will produce the same failure.
+/// Auth errors are not retryable — same credentials will produce the same failure.
 fn is_auth_error<E: aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata>(err: &E) -> bool {
     matches!(
         err.code(),
@@ -271,34 +335,54 @@ mod tests {
         CwLogsClient::new_with_client(client, config)
     }
 
+    fn batch_with_event() -> SealedBatch {
+        SealedBatch {
+            log_group: "test-group".to_string(),
+            log_stream: "test-stream".to_string(),
+            events: vec![crate::scanner::LogEvent {
+                timestamp: 1000,
+                message: "hello".to_string(),
+            }],
+        }
+    }
+
     #[test]
     fn test_cw_upload_error_display() {
-        assert_eq!(CwUploadError::AuthError.to_string(), "authentication error");
+        assert_eq!(CwUploadError::Auth.to_string(), "authentication error");
         assert_eq!(
-            CwUploadError::Retriable("timeout".into()).to_string(),
-            "retriable: timeout"
+            CwUploadError::Retryable("timeout".into()).to_string(),
+            "retryable: timeout"
         );
-        assert_eq!(CwUploadError::Other("bad".into()).to_string(), "bad");
+        assert_eq!(CwUploadError::Fatal("bad".into()).to_string(), "bad");
     }
 
     #[test]
     fn test_cw_upload_error_variants() {
-        let auth = CwUploadError::AuthError;
-        assert!(matches!(auth, CwUploadError::AuthError));
+        let auth = CwUploadError::Auth;
+        assert!(matches!(auth, CwUploadError::Auth));
 
-        let retriable = CwUploadError::Retriable("connection error".to_string());
-        if let CwUploadError::Retriable(msg) = retriable {
+        let retryable = CwUploadError::Retryable("connection error".to_string());
+        if let CwUploadError::Retryable(msg) = retryable {
             assert_eq!(msg, "connection error");
         } else {
-            panic!("Expected Retriable variant");
+            panic!("Expected Retryable variant");
         }
 
-        let other = CwUploadError::Other("test error".to_string());
-        if let CwUploadError::Other(msg) = other {
+        let fatal = CwUploadError::Fatal("test error".to_string());
+        if let CwUploadError::Fatal(msg) = fatal {
             assert_eq!(msg, "test error");
         } else {
-            panic!("Expected Other variant");
+            panic!("Expected Fatal variant");
         }
+    }
+
+    #[test]
+    fn test_upload_outcome_variants() {
+        assert!(matches!(UploadOutcome::Success, UploadOutcome::Success));
+        assert!(matches!(
+            UploadOutcome::RetriesExhausted,
+            UploadOutcome::RetriesExhausted
+        ));
     }
 
     #[test]
@@ -323,30 +407,6 @@ mod tests {
     }
 
     #[test]
-    fn test_limit_exceeded_on_group_create() {
-        let err =
-            CwUploadError::Retriable("LimitExceededException on create_log_group".to_string());
-        if let CwUploadError::Retriable(msg) = err {
-            assert!(msg.contains("LimitExceededException"));
-            assert!(msg.contains("create_log_group"));
-        } else {
-            panic!("Expected Retriable variant");
-        }
-    }
-
-    #[test]
-    fn test_limit_exceeded_on_stream_create() {
-        let err =
-            CwUploadError::Retriable("LimitExceededException on create_log_stream".to_string());
-        if let CwUploadError::Retriable(msg) = err {
-            assert!(msg.contains("LimitExceededException"));
-            assert!(msg.contains("create_log_stream"));
-        } else {
-            panic!("Expected Retriable variant");
-        }
-    }
-
-    #[test]
     fn test_client_can_be_recreated() {
         let mut cw = make_test_client();
         cw.mark_group_created("test-group");
@@ -356,41 +416,51 @@ mod tests {
         assert!(cw.created_streams().contains("test-group:test-stream"));
     }
 
-    #[tokio::test]
-    async fn test_resource_not_found_clears_cache() {
+    // --- Replay-client helpers for end-to-end retry behavior ---
+
+    fn ok_response() -> http::Response<aws_smithy_types::body::SdkBody> {
+        http::Response::builder()
+            .status(200)
+            .body(aws_smithy_types::body::SdkBody::from("{}"))
+            .unwrap()
+    }
+
+    fn error_response(
+        status: u16,
+        body: &'static str,
+    ) -> http::Response<aws_smithy_types::body::SdkBody> {
+        http::Response::builder()
+            .status(status)
+            .body(aws_smithy_types::body::SdkBody::from(body))
+            .unwrap()
+    }
+
+    fn dummy_request() -> http::Request<aws_smithy_types::body::SdkBody> {
+        http::Request::builder()
+            .uri("https://logs.us-east-1.amazonaws.com/")
+            .body(aws_smithy_types::body::SdkBody::empty())
+            .unwrap()
+    }
+
+    fn replay_client(
+        responses: Vec<http::Response<aws_smithy_types::body::SdkBody>>,
+    ) -> aws_smithy_http_client::test_util::StaticReplayClient {
         use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
-        use aws_smithy_types::body::SdkBody;
+        StaticReplayClient::new(
+            responses
+                .into_iter()
+                .map(|resp| ReplayEvent::new(dummy_request(), resp))
+                .collect(),
+        )
+    }
 
-        fn ok_response() -> http::Response<SdkBody> {
-            http::Response::builder()
-                .status(200)
-                .body(SdkBody::from("{}"))
-                .unwrap()
-        }
-        fn resource_not_found_response() -> http::Response<SdkBody> {
-            http::Response::builder()
-                .status(400)
-                .body(SdkBody::from(
-                    r#"{"__type":"ResourceNotFoundException","message":"The specified log group does not exist."}"#,
-                ))
-                .unwrap()
-        }
-        fn dummy_request() -> http::Request<SdkBody> {
-            http::Request::builder()
-                .uri("https://logs.us-east-1.amazonaws.com/")
-                .body(SdkBody::empty())
-                .unwrap()
-        }
-
-        let replay_client = StaticReplayClient::new(vec![
-            // CreateLogGroup → 200 OK
-            ReplayEvent::new(dummy_request(), ok_response()),
-            // CreateLogStream → 200 OK
-            ReplayEvent::new(dummy_request(), ok_response()),
-            // PutLogEvents → ResourceNotFoundException
-            ReplayEvent::new(dummy_request(), resource_not_found_response()),
-        ]);
-
+    fn client_with_responses(
+        responses: Vec<http::Response<aws_smithy_types::body::SdkBody>>,
+    ) -> (
+        CwLogsClient,
+        aws_smithy_http_client::test_util::StaticReplayClient,
+    ) {
+        let replay = replay_client(responses);
         let config = aws_sdk_cloudwatchlogs::Config::builder()
             .behavior_version(aws_sdk_cloudwatchlogs::config::BehaviorVersion::latest())
             .credentials_provider(aws_sdk_cloudwatchlogs::config::Credentials::new(
@@ -400,26 +470,28 @@ mod tests {
             .retry_config(
                 aws_sdk_cloudwatchlogs::config::retry::RetryConfig::standard().with_max_attempts(1),
             )
-            .http_client(replay_client)
+            .http_client(replay.clone())
             .build();
         let client = Client::from_conf(config.clone());
-        let mut cw = CwLogsClient::new_with_client(client, config);
+        (CwLogsClient::new_with_client(client, config), replay)
+    }
 
-        let batch = SealedBatch {
-            log_group: "test-group".to_string(),
-            log_stream: "test-stream".to_string(),
-            events: vec![crate::scanner::LogEvent {
-                timestamp: 1000,
-                message: "hello".to_string(),
-            }],
-        };
+    #[tokio::test]
+    async fn test_resource_not_found_clears_cache() {
+        let (mut cw, _replay) = client_with_responses(vec![
+            ok_response(), // CreateLogGroup
+            ok_response(), // CreateLogStream
+            error_response(
+                400,
+                r#"{"__type":"ResourceNotFoundException","message":"The specified log group does not exist."}"#,
+            ),
+        ]);
 
-        let result = cw.upload_batch(&batch).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let batch = batch_with_event();
+        let err = cw.upload_batch(&batch).await.unwrap_err();
         assert!(
-            matches!(&err, CwUploadError::Retriable(msg) if msg.contains("ResourceNotFound")),
-            "Expected Retriable(ResourceNotFound), got: {err}"
+            matches!(&err, CwUploadError::Retryable(msg) if msg.contains("ResourceNotFound")),
+            "Expected Retryable(ResourceNotFound), got: {err}"
         );
         assert!(
             !cw.created_groups().contains("test-group"),
@@ -429,5 +501,58 @@ mod tests {
             !cw.created_streams().contains("test-group:test-stream"),
             "Log stream should be cleared from cache after ResourceNotFoundException"
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_recreates_and_succeeds_on_resource_not_found() {
+        // First attempt: create group/stream OK, put → ResourceNotFound (clears cache).
+        // Single re-attempt: re-create group/stream, put → OK.
+        let (mut cw, _replay) = client_with_responses(vec![
+            ok_response(), // CreateLogGroup (attempt 1)
+            ok_response(), // CreateLogStream (attempt 1)
+            error_response(
+                400,
+                r#"{"__type":"ResourceNotFoundException","message":"missing"}"#,
+            ), // PutLogEvents (attempt 1)
+            ok_response(), // CreateLogGroup (attempt 2)
+            ok_response(), // CreateLogStream (attempt 2)
+            ok_response(), // PutLogEvents (attempt 2)
+        ]);
+
+        let batch = batch_with_event();
+        let outcome = cw.upload_batch_with_retry(&batch).await.unwrap();
+        assert!(matches!(outcome, UploadOutcome::Success));
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_fatal_does_not_retry() {
+        // InvalidParameter is fatal — no re-attempt; only the first 3 calls are consumed.
+        let (mut cw, replay) = client_with_responses(vec![
+            ok_response(), // CreateLogGroup
+            ok_response(), // CreateLogStream
+            error_response(
+                400,
+                r#"{"__type":"InvalidParameterException","message":"bad"}"#,
+            ), // PutLogEvents
+        ]);
+
+        let batch = batch_with_event();
+        let outcome = cw.upload_batch_with_retry(&batch).await.unwrap();
+        assert!(matches!(outcome, UploadOutcome::RetriesExhausted));
+        // No second attempt: exactly the 3 seeded requests were issued.
+        assert_eq!(replay.actual_requests().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_with_retry_auth_propagates() {
+        // CreateLogGroup → AccessDenied surfaces as Auth, propagated to the caller.
+        let (mut cw, _replay) = client_with_responses(vec![error_response(
+            400,
+            r#"{"__type":"AccessDeniedException","message":"denied"}"#,
+        )]);
+
+        let batch = batch_with_event();
+        let err = cw.upload_batch_with_retry(&batch).await.unwrap_err();
+        assert!(matches!(err, CwUploadError::Auth));
     }
 }
